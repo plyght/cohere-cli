@@ -1,4 +1,8 @@
-# 💬🤖 Cohere CLI: Seamlessly interact with Cohere's AI directly from your terminal! 🚀✨
+# 💬🌸 Cohere CLI: Seamlessly interact with Cohere's AI directly from your terminal!
+![ascii-art-6_upscayl_4x_upscayl-standard-4x](https://github.com/user-attachments/assets/b848c8dd-0a15-478b-baed-036a3aae2e7d)
+
+
+
 
 **Cohere CLI** is a powerful and user-friendly command-line interface that allows seamless interaction with Cohere's AI models directly from your terminal. Whether you're looking to engage in multi-turn conversations, perform single-turn web searches, or utilize dynamic content injection based on your preferences, **Cohere CLI** has you covered.
 
