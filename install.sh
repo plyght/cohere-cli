@@ -2,7 +2,7 @@
 
 set -e
 
-# Variables
+# Variables.
 SCRIPT_URL="https://www.peril.lol/cohere/install.sh"  # Hosted install.sh in site repo
 INSTALL_DIR="$HOME/bin"
 SCRIPT_NAME="cohere"
