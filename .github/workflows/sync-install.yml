@@ -1,0 +1,43 @@
+name: Sync install.sh to Site Repository
+
+on:
+  push:
+    paths:
+      - 'install.sh'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout cohere-cli repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Clone Site Repository
+        env:
+          PAT: ${{ secrets.SITE_REPO_PAT }}
+        run: |
+          git clone https://$PAT@github.com/plyght/peril.lol.git site-repo
+          cd site-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Copy install.sh to Site Repository's cohere Folder
+        run: |
+          mkdir -p site-repo/cohere
+          cp install.sh site-repo/cohere/install.sh
+          cd site-repo
+          git add cohere/install.sh
+          if ! git diff --cached --quiet; then
+            git commit -m "Update install.sh from cohere-cli repo"
+            git push origin main
+          else
+            echo "No changes to push."
+          fi
