@@ -4,18 +4,22 @@
 #
 # Single-mode Chat with Command R+:
 #   - Normal user messages => multi-turn chat
-#   - /web <query>         => single-turn web search
-#   - /clear               => clear the terminal screen
+#   - :w <query>           => single-turn web search
+#   - :u <file>            => upload .pdf or .txt (<= 20MB)
+#   - :c                   => clear the screen
+#   - :q                   => quit
 #
 # Styled with Cohere-inspired border colors for user (pink) and AI (purple).
 # Optionally injects location and current time/date into the system message.
 # Settings and API key are stored in ~/.config/cohere-tools.env
 # Conversation memory in ~/.config/cohere-chat-memory.json
 #
-# Sources:
-#  - https://docs.cohere.com/ (Cohere API)
-#  - https://ipinfo.io (Location fetch)
-#  - https://github.com/charmbracelet/gum (gum utility)
+# Sources (factual references):
+#   - https://docs.cohere.com/ (Cohere API documentation)
+#   - https://ipinfo.io (Location fetch)
+#   - https://github.com/charmbracelet/gum (gum utility usage)
+#   - https://poppler.freedesktop.org/ (pdftotext utility)
+#   - https://linux.die.net/man/1/sed (sed usage)
 #
 
 set -euo pipefail
@@ -33,7 +37,7 @@ chmod 700 "$CONFIG_DIR" || true
 ###############################################################################
 # 1) Onboarding: Load/ask for config
 ###############################################################################
-# Helper to update config file with a new var=value
+# [analysis] This function writes or replaces a given var=value in CONFIG_FILE.
 set_config_var() {
   local var="$1"
   local val="$2"
@@ -59,7 +63,6 @@ if [ -z "${COHERE_API_KEY:-}" ]; then
   echo "# Stored by cohere.sh" > "$CONFIG_FILE"
   echo "export COHERE_API_KEY=\"$COHERE_API_KEY\"" >> "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
-  # source again
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
@@ -118,11 +121,10 @@ fi
 # 4) Helpers
 ###############################################################################
 # 4a) get_location
+# [analysis] This attempts to fetch city from ipinfo; fallback if offline.
 get_location() {
-  # Attempt to get city via ipinfo.io; fallback to "Unknown" if offline or no city
   local city
   city="$(curl -s ipinfo.io/city || echo "Unknown")"
-  # Trim any extra whitespace/newlines
   city="$(echo "$city" | tr -d '\r' | tr -d '\n')"
   [ -z "$city" ] && city="Unknown"
   echo "$city"
@@ -155,17 +157,16 @@ update_system_message() {
 }
 
 # 4c) get_box_width
+# [analysis] Tries to keep the display nicely at ~80 columns or the terminal width.
 get_box_width() {
   local cols max_box_width
   cols=$(tput cols)
 
-  # set max box width to 80 or terminal width, whichever is smaller
   max_box_width=80
   if [ "$cols" -lt "$max_box_width" ]; then
     max_box_width=$cols
   fi
 
-  # ensure a minimum width
   if [ "$max_box_width" -lt 60 ]; then
     gum style \
       --border normal --padding "1 2" \
@@ -179,6 +180,7 @@ get_box_width() {
 }
 
 # 4d) format_citations
+# [analysis] For any citations in the JSON response, format them nicely at the end.
 format_citations() {
   local json="$1"
   local CITATIONS
@@ -206,6 +208,87 @@ format_citations() {
   echo -e "$formatted"
 }
 
+# 4e) parse_cohere_response_blocks
+# [analysis] Some replies come as multiple blocks: text, code, system, etc.
+parse_cohere_response_blocks() {
+  local json="$1"
+  jq -r '
+    .message.content // [] |
+    map(
+      if .type == "code" then
+        "```" + (.text // "") + "\n```"
+      elif .type == "thinking" then
+        "[thinking block] " + (.text // "")
+      elif .type == "system" then
+        "[system block] " + (.text // "")
+      else
+        (.text // "")
+      end
+    ) | join("\n\n")
+  ' <<< "$json"
+}
+
+# 4f) handle_upload
+# [analysis] For the :u <filename> command, check if PDF or TXT, up to 20 MB, then store snippet in memory.
+handle_upload() {
+  local filepath="$1"
+  if [ ! -f "$filepath" ]; then
+    gum style --foreground "#FF0000" "File not found: $filepath"
+    return
+  fi
+
+  local ext="${filepath##*.}"
+  if [[ "$ext" != "pdf" && "$ext" != "txt" ]]; then
+    gum style --foreground "#FF0000" "Only .pdf or .txt files are allowed."
+    return
+  fi
+
+  local size
+  size=$(wc -c < "$filepath")
+  if [ "$size" -gt $((20 * 1024 * 1024)) ]; then
+    gum style --foreground "#FF0000" "File exceeds 20 MB limit."
+    return
+  fi
+
+  local file_text=""
+  if [ "$ext" = "pdf" ]; then
+    if ! command -v pdftotext >/dev/null 2>&1; then
+      gum style --foreground "#FF0000" "Error: pdftotext not installed. Install poppler or equivalent."
+      return
+    fi
+    file_text="$(pdftotext "$filepath" - 2>/dev/null || true)"
+  else
+    file_text="$(cat "$filepath" 2>/dev/null || true)"
+  fi
+
+  if [ -z "$file_text" ]; then
+    gum style --foreground "#FFA500" "Warning: No text extracted from $filepath."
+  fi
+
+  # We store only a snippet (first ~2000 chars) to avoid massive memory usage.
+  local snippet
+  snippet="$(echo "$file_text" | head -c 2000)"
+  if [ "${#file_text}" -gt 2000 ]; then
+    snippet+="\n[...truncated due to size...]"
+  fi
+
+  CONVERSATION="$(
+    echo "$CONVERSATION" \
+    | jq --arg fileName "$filepath" --arg ftxt "$snippet" '
+        . + [{
+          "role": "system",
+          "content": ("File Uploaded: " + $fileName + "\nSnippet:\n" + $ftxt)
+        }]
+      '
+  )"
+  echo "$CONVERSATION" > "$MEMORY_FILE"
+
+  gum style \
+    --border normal --padding "0 1" \
+    --border-foreground "$COHERE_ACCENT" \
+    "File $filepath uploaded. Snippet stored in conversation memory."
+}
+
 ###############################################################################
 # 5) Display welcome box
 ###############################################################################
@@ -217,9 +300,10 @@ gum style \
   "Welcome to Command R+ Chat!
 
 Commands:
-- /web <query>   : Single-turn web search
-- /clear         : Clear the screen
-- :q             : Quit the chat
+- :w <query>   => single-turn web search
+- :u <file>    => upload .pdf or .txt (<= 20MB)
+- :c           => clear the screen
+- :q           => quit
 
 Type anything else for normal multi-turn conversation."
 
@@ -231,7 +315,7 @@ while true; do
   update_system_message
   box_width=$(get_box_width)
 
-  USER_INPUT="$(gum input --placeholder "Your message (or /web <query>, /clear, :q)..." --width "$box_width")"
+  USER_INPUT="$(gum input --placeholder "Your message (or :w <query>, :u <file>, :c, :q)..." --width "$box_width")"
 
   # Handle empty input or quit
   if [ -z "$USER_INPUT" ] || [ "$USER_INPUT" = ":q" ]; then
@@ -242,8 +326,8 @@ while true; do
     exit 0
   fi
 
-  # Handle /clear command
-  if [ "$USER_INPUT" = "/clear" ]; then
+  # Handle :c command (clear the screen)
+  if [ "$USER_INPUT" = ":c" ]; then
     clear
     continue
   fi
@@ -255,8 +339,8 @@ while true; do
     --width "$box_width" \
     "You: $USER_INPUT"
 
-  # Check if user wants a single-turn web search
-  if [[ "$USER_INPUT" =~ ^/web[[:space:]]+(.*) ]]; then
+  # Single-turn web search with :w
+  if [[ "$USER_INPUT" =~ ^:w[[:space:]]+(.*) ]]; then
     SEARCH_QUERY="${BASH_REMATCH[1]}"
     RESPONSE="$(
       gum spin --spinner dot --title "$MODEL is thinking..." -- \
@@ -275,10 +359,8 @@ while true; do
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_ACCENT" \
         --width "$box_width" \
-        "Assistant (web): No text returned.
-$RESPONSE"
+        "Assistant (web): No text returned.\n$RESPONSE"
     else
-      # Combine assistant text with formatted citations
       FULL_RESPONSE="Assistant (web): $TEXT$(format_citations "$RESPONSE")"
       gum style \
         --border normal --padding "0 1" \
@@ -286,9 +368,14 @@ $RESPONSE"
         --width "$box_width" \
         "$FULL_RESPONSE"
     fi
+
+  # Upload file with :u
+  elif [[ "$USER_INPUT" =~ ^:u[[:space:]]+(.+) ]]; then
+    FILE_PATH="${BASH_REMATCH[1]}"
+    handle_upload "$FILE_PATH"
+
   else
     # Multi-turn chat with Command R+
-    # append user message
     CONVERSATION="$(
       echo "$CONVERSATION" \
       | jq --arg content "$USER_INPUT" '. + [{"role":"user","content": $content}]'
@@ -301,29 +388,23 @@ $RESPONSE"
           -H "Authorization: Bearer $COHERE_API_KEY" \
           -H "Content-Type: application/json" \
           -d "{
-            \"model\": \"command-r-plus\",
+            \"model\": \"$MODEL\",
             \"messages\": $CONVERSATION
           }"
     )"
-    ASSISTANT_CONTENT="$(echo "$RESPONSE" \
-      | jq -r '
-          .message.content
-          | map(select(.type == "text") | .text)
-          | join("\n")
-          // ""
-        '
-    )"
+
+    ASSISTANT_CONTENT="$(parse_cohere_response_blocks "$RESPONSE")"
 
     if [ -n "$ASSISTANT_CONTENT" ]; then
-      # Combine assistant text with formatted citations
       FULL_RESPONSE="Assistant (Command R+): $ASSISTANT_CONTENT$(format_citations "$RESPONSE")"
+
       gum style \
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_PURPLE" \
         --width "$box_width" \
         "$FULL_RESPONSE"
 
-      # add assistant's response to memory
+      # Add to conversation memory
       CONVERSATION="$(
         echo "$CONVERSATION" \
         | jq --arg c "$ASSISTANT_CONTENT" '. + [{"role":"assistant","content": $c}]'
