@@ -24,15 +24,20 @@
 
 set -euo pipefail
 
+# CLI Version
+CLI_VERSION="1.0.0"
+
 ###############################################################################
 # 0) Basic paths and config
 ###############################################################################
-CONFIG_DIR="$HOME/.config"
-CONFIG_FILE="$CONFIG_DIR/cohere-tools.env"
-MEMORY_FILE="$CONFIG_DIR/cohere-chat-memory.json"
+CONFIG_DIR="$HOME/.config/cohere-cli"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+MEMORY_FILE="$CONFIG_DIR/chat-memory.json"
+DEBUG_DIR="$CONFIG_DIR/debug"
 
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR" || true
+# Create config directories with correct permissions
+mkdir -p "$CONFIG_DIR" "$DEBUG_DIR"
+chmod 700 "$CONFIG_DIR" "$DEBUG_DIR" || true
 
 ###############################################################################
 # 1) Onboarding: Load/ask for config
@@ -91,6 +96,18 @@ if [ -z "${COHERE_INJECT_TIME:-}" ]; then
   source "$CONFIG_FILE"
 fi
 
+# 1e) Ask for debug mode preference if not set
+if [ -z "${COHERE_DEBUG_MODE:-}" ]; then
+  gum style --foreground "#FFA500" "Would you like to enable debug output?"
+  if gum confirm; then
+    set_config_var "COHERE_DEBUG_MODE" "true"
+  else
+    set_config_var "COHERE_DEBUG_MODE" "false"
+  fi
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
 ###############################################################################
 # 2) Basic definitions and color styling
 ###############################################################################
@@ -104,18 +121,29 @@ COHERE_ACCENT="#A78BFA"   # Used for border colors in other styled boxes
 ###############################################################################
 # 3) Prepare conversation memory
 ###############################################################################
-if [ -f "$MEMORY_FILE" ]; then
-  CONVERSATION="$(cat "$MEMORY_FILE")"
-else
-  # Initial conversation with a placeholder system message
-  CONVERSATION='[
-    {
-      "role": "system",
-      "content": "You are an AI assistant powered by Command R+."
-    }
-  ]'
+# Init or validate conversation memory
+init_conversation() {
+  # Initial conversation history - empty at start
+  CONVERSATION='[]'
+  
+  # Write fresh conversation to memory file
   echo "$CONVERSATION" > "$MEMORY_FILE"
+  chmod 600 "$MEMORY_FILE" || true
+  
+  # Set the system message separately
+  SYSTEM_MESSAGE="You are an AI assistant powered by Command R+."
+}
+
+# Initialize the system message
+SYSTEM_MESSAGE="You are an AI assistant powered by Command R+."
+
+# For this version, let's always start with a clean conversation
+# to ensure we're using the right role format
+if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
+  gum style --foreground "#FFA500" "Starting with fresh conversation history."
 fi
+rm -f "$MEMORY_FILE" 2>/dev/null || true
+init_conversation
 
 ###############################################################################
 # 4) Helpers
@@ -143,17 +171,11 @@ update_system_message() {
     now="$(date)"  # e.g. "Mon Jan  1 12:34:56 PM EST 2025"
   fi
 
-  local newSystemContent="You are an AI assistant powered by Command R+."
-  newSystemContent+="\n\nLocation: $city"
-  newSystemContent+="\nLocal time/date: $now"
-  newSystemContent+="\nUse this context as needed to inform your answers."
-
-  # Replace the first system message in the conversation
-  CONVERSATION="$(
-    echo "$CONVERSATION" \
-    | jq --arg content "$newSystemContent" '.[0].content = $content'
-  )"
-  echo "$CONVERSATION" > "$MEMORY_FILE"
+  # Update the system message
+  SYSTEM_MESSAGE="You are an AI assistant powered by Command R+."
+  SYSTEM_MESSAGE+="\n\nLocation: $city"
+  SYSTEM_MESSAGE+="\nLocal time/date: $now"
+  SYSTEM_MESSAGE+="\nUse this context as needed to inform your answers."
 }
 
 # 4c) get_box_width
@@ -183,26 +205,56 @@ get_box_width() {
 # [analysis] For any citations in the JSON response, format them nicely at the end.
 format_citations() {
   local json="$1"
-  local CITATIONS
-  CITATIONS="$(echo "$json" | jq -c '.message.citations // .citations // []')"
-  local NUM
-  NUM="$(echo "$CITATIONS" | jq 'length')"
   local formatted=""
-
-  if [ "$NUM" -gt 0 ]; then
-    formatted+="\n--\nCitations:"
-    for i in $(seq 0 $((NUM-1))); do
-      local start end text url
-      start="$(echo "$CITATIONS" | jq -r ".[$i].start // \"\"")"
-      end="$(echo "$CITATIONS" | jq -r ".[$i].end // \"\"")"
-      text="$(echo "$CITATIONS" | jq -r ".[$i].text // \"\"")"
-      url="$(echo "$CITATIONS" | jq -r ".[$i].url // .[$i].link // \"\"")"
-      if [ -n "$url" ] && [ "$url" != "null" ]; then
-        formatted+="\n($start..$end) '$text' → $url"
-      else
-        formatted+="\n($start..$end) '$text'"
-      fi
-    done
+  
+  # Check if json is empty or invalid
+  if [ -z "$json" ] || ! echo "$json" | jq -e '.' >/dev/null 2>&1; then
+    return
+  fi
+  
+  # Try to extract citations using different possible formats
+  local has_citations=false
+  local CITATIONS=""
+  
+  # Try modern v2 format
+  if echo "$json" | jq -e 'has("message") and (.message | has("citations"))' >/dev/null 2>&1; then
+    CITATIONS="$(echo "$json" | jq -c '.message.citations // []')"
+    has_citations=true
+  # Try v1 format
+  elif echo "$json" | jq -e 'has("citations")' >/dev/null 2>&1; then
+    CITATIONS="$(echo "$json" | jq -c '.citations // []')"
+    has_citations=true
+  # Try other known formats
+  elif echo "$json" | jq -e 'has("documents") or has("web_search")' >/dev/null 2>&1; then
+    CITATIONS="$(echo "$json" | jq -c '.documents // .web_search // []')"
+    has_citations=true
+  fi
+  
+  if [ "$has_citations" = "true" ] && [ -n "$CITATIONS" ]; then
+    local NUM
+    NUM="$(echo "$CITATIONS" | jq 'length' 2>/dev/null || echo 0)"
+    
+    if [ "$NUM" -gt 0 ]; then
+      formatted+="\n--\nCitations:"
+      for i in $(seq 0 $((NUM-1))); do
+        local source_text source_url title
+        
+        # Try different citation formats
+        source_text="$(echo "$CITATIONS" | jq -r ".[$i].text // .[$i].snippet // .[$i].title // \"(no text)\"" 2>/dev/null)"
+        source_url="$(echo "$CITATIONS" | jq -r ".[$i].url // .[$i].link // .[$i].source // \"\"" 2>/dev/null)"
+        title="$(echo "$CITATIONS" | jq -r ".[$i].title // \"\"" 2>/dev/null)"
+        
+        if [ -n "$source_url" ] && [ "$source_url" != "null" ]; then
+          if [ -n "$title" ] && [ "$title" != "null" ]; then
+            formatted+="\n[$((i+1))] '$title': $source_url"
+          else
+            formatted+="\n[$((i+1))] $source_text → $source_url"
+          fi
+        else
+          formatted+="\n[$((i+1))] $source_text"
+        fi
+      done
+    fi
   fi
 
   echo -e "$formatted"
@@ -212,20 +264,45 @@ format_citations() {
 # [analysis] Some replies come as multiple blocks: text, code, system, etc.
 parse_cohere_response_blocks() {
   local json="$1"
-  jq -r '
-    .message.content // [] |
-    map(
-      if .type == "code" then
-        "```" + (.text // "") + "\n```"
-      elif .type == "thinking" then
-        "[thinking block] " + (.text // "")
-      elif .type == "system" then
-        "[system block] " + (.text // "")
+  
+  # First check if this is an error response
+  if echo "$json" | jq -e 'has("message") and (.message | type == "string")' >/dev/null 2>&1; then
+    echo "API Error: $(echo "$json" | jq -r '.message')"
+    return
+  fi
+  
+  # Then try to parse the content
+  local result
+  result=$(jq -r '
+    if has("message") and (.message | has("content")) then
+      .message.content | 
+      if type == "array" then
+        map(
+          if .type == "code" then
+            "```" + (.text // "") + "\n```"
+          elif .type == "thinking" then
+            "[thinking block] " + (.text // "")
+          elif .type == "system" then
+            "[system block] " + (.text // "")
+          else
+            (.text // "")
+          end
+        ) | join("\n\n")
       else
-        (.text // "")
+        .
       end
-    ) | join("\n\n")
-  ' <<< "$json"
+    elif has("text") then
+      .text
+    elif has("reply") then
+      .reply
+    elif has("response") then
+      .response
+    else
+      "Unable to parse API response"
+    end
+  ' <<< "$json" 2>/dev/null || echo "Error parsing JSON response")
+  
+  echo "$result"
 }
 
 # 4f) handle_upload
@@ -272,14 +349,14 @@ handle_upload() {
     snippet+="\n[...truncated due to size...]"
   fi
 
+  # We append this to the system message instead
+  FILE_CONTEXT="\n\nFile Uploaded: $filepath\nSnippet:\n$snippet"
+  SYSTEM_MESSAGE+="$FILE_CONTEXT"
+  
+  # Also add a message to the conversation history
   CONVERSATION="$(
     echo "$CONVERSATION" \
-    | jq --arg fileName "$filepath" --arg ftxt "$snippet" '
-        . + [{
-          "role": "system",
-          "content": ("File Uploaded: " + $fileName + "\nSnippet:\n" + $ftxt)
-        }]
-      '
+    | jq --arg content "I've uploaded the file: $filepath" '. + [{"role":"User","content": $content}]'
   )"
   echo "$CONVERSATION" > "$MEMORY_FILE"
 
@@ -297,12 +374,13 @@ gum style \
   --border normal --padding "1 2" \
   --border-foreground "$COHERE_ACCENT" \
   --width "$box_width" \
-  "Welcome to Command R+ Chat!
+  "Welcome to Command R+ Chat! (v$CLI_VERSION)
 
 Commands:
 - :w <query>   => single-turn web search
 - :u <file>    => upload .pdf or .txt (<= 20MB)
 - :c           => clear the screen
+- :d           => toggle debug mode
 - :q           => quit
 
 Type anything else for normal multi-turn conversation."
@@ -315,7 +393,7 @@ while true; do
   update_system_message
   box_width=$(get_box_width)
 
-  USER_INPUT="$(gum input --placeholder "Your message (or :w <query>, :u <file>, :c, :q)..." --width "$box_width")"
+  USER_INPUT="$(gum input --placeholder "Your message (or :w <query>, :u <file>, :c, :d, :q)..." --width "$box_width")"
 
   # Handle empty input or quit
   if [ -z "$USER_INPUT" ] || [ "$USER_INPUT" = ":q" ]; then
@@ -331,6 +409,20 @@ while true; do
     clear
     continue
   fi
+  
+  # Handle :d command (toggle debug mode)
+  if [ "$USER_INPUT" = ":d" ]; then
+    if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
+      set_config_var "COHERE_DEBUG_MODE" "false"
+      gum style --foreground "#FFA500" "Debug mode turned OFF"
+    else
+      set_config_var "COHERE_DEBUG_MODE" "true"
+      gum style --foreground "#FFA500" "Debug mode turned ON"
+    fi
+    # Re-source the config to get the updated value
+    source "$CONFIG_FILE"
+    continue
+  fi
 
   # Print user input
   gum style \
@@ -343,25 +435,28 @@ while true; do
   if [[ "$USER_INPUT" =~ ^:w[[:space:]]+(.*) ]]; then
     SEARCH_QUERY="${BASH_REMATCH[1]}"
     RESPONSE="$(
-      gum spin --spinner dot --title "$MODEL is thinking..." -- \
-        curl -s -X POST "https://api.cohere.ai/chat" \
+      gum spin --spinner dot --title "$MODEL is thinking (web search)..." -- \
+        curl -s -X POST "https://api.cohere.ai/v1/chat" \
           -H "Authorization: Bearer $COHERE_API_KEY" \
           -H "Content-Type: application/json" \
           -d "{
+            \"model\": \"$MODEL\",
             \"message\": \"$SEARCH_QUERY\",
+            \"preamble\": \"$SYSTEM_MESSAGE\",
             \"connectors\": [{\"id\": \"web-search\"}]
           }"
     )"
-    TEXT="$(echo "$RESPONSE" | jq -r '.text // .reply // ""')"
-
-    if [ -z "$TEXT" ]; then
+    
+    ASSISTANT_CONTENT="$(parse_cohere_response_blocks "$RESPONSE")"
+    
+    if [ -z "$ASSISTANT_CONTENT" ]; then
       gum style \
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_ACCENT" \
         --width "$box_width" \
-        "Assistant (web): No text returned.\n$RESPONSE"
+        "Assistant (web): No text returned.\nRaw response: $(echo "$RESPONSE" | jq -c '.')"
     else
-      FULL_RESPONSE="Assistant (web): $TEXT$(format_citations "$RESPONSE")"
+      FULL_RESPONSE="Assistant (web): $ASSISTANT_CONTENT$(format_citations "$RESPONSE")"
       gum style \
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_PURPLE" \
@@ -376,21 +471,45 @@ while true; do
 
   else
     # Multi-turn chat with Command R+
+    # Add user message to conversation history
     CONVERSATION="$(
       echo "$CONVERSATION" \
-      | jq --arg content "$USER_INPUT" '. + [{"role":"user","content": $content}]'
+      | jq --arg content "$USER_INPUT" '. + [{"role":"User","content": $content}]'
     )"
+    
+    # Save conversation to file
     echo "$CONVERSATION" > "$MEMORY_FILE"
-
+    
+    # Create a clean chat history (skip the current user message)
+    CHAT_HISTORY=$(echo "$CONVERSATION" | jq 'map(select(.content != "'"$USER_INPUT"'"))')
+    
+    # Prepare the request
+    REQUEST="{
+        \"model\": \"$MODEL\",
+        \"message\": \"$USER_INPUT\",
+        \"chat_history\": $CHAT_HISTORY,
+        \"preamble\": \"$SYSTEM_MESSAGE\"
+    }"
+    
+    # Debug info if enabled
+    if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
+      NUM_MESSAGES=$(echo "$CONVERSATION" | jq '. | length')
+      HISTORY_SAMPLE=$(echo "$CONVERSATION" | jq -c '.')
+      gum style --foreground "#FFA500" "Sending request with $NUM_MESSAGES message(s) in history"
+      gum style --foreground "#FFA500" "Sample: $HISTORY_SAMPLE"
+      
+      # Write the request to a debug file
+      echo "$REQUEST" > "$DEBUG_DIR/last-request.json"
+      gum style --foreground "#FFA500" "Request saved to $DEBUG_DIR/last-request.json"
+    fi
+    
+    # Make the API call using v1 endpoint with chat_history
     RESPONSE="$(
       gum spin --spinner dot --title "$MODEL is thinking..." -- \
-        curl -s "https://api.cohere.ai/v2/chat" \
+        curl -s "https://api.cohere.ai/v1/chat" \
           -H "Authorization: Bearer $COHERE_API_KEY" \
           -H "Content-Type: application/json" \
-          -d "{
-            \"model\": \"$MODEL\",
-            \"messages\": $CONVERSATION
-          }"
+          -d "$REQUEST"
     )"
 
     ASSISTANT_CONTENT="$(parse_cohere_response_blocks "$RESPONSE")"
@@ -407,15 +526,27 @@ while true; do
       # Add to conversation memory
       CONVERSATION="$(
         echo "$CONVERSATION" \
-        | jq --arg c "$ASSISTANT_CONTENT" '. + [{"role":"assistant","content": $c}]'
+        | jq --arg c "$ASSISTANT_CONTENT" '. + [{"role":"Chatbot","content": $c}]'
       )"
       echo "$CONVERSATION" > "$MEMORY_FILE"
     else
+      # Display raw response for debugging
+      RAW_RESPONSE=$(echo "$RESPONSE" | jq -c '.')
+      ERROR_MESSAGE="No content found from assistant"
+      
+      if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
+        ERROR_MESSAGE="$ERROR_MESSAGE. Raw response: $RAW_RESPONSE"
+        
+        # Write the raw response to a debug file
+        echo "$RAW_RESPONSE" > "$DEBUG_DIR/last-error.json"
+        gum style --foreground "#FFA500" "Debug info saved to $DEBUG_DIR/last-error.json"
+      fi
+      
       gum style \
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_ACCENT" \
         --width "$box_width" \
-        "No content found from assistant."
+        "$ERROR_MESSAGE"
     fi
   fi
 done
