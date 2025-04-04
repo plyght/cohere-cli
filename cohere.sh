@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # CLI Version
-CLI_VERSION="1.0.0"
+CLI_VERSION="1.1.0"
 
 ###############################################################################
 # 0) Basic paths and config
@@ -48,7 +48,12 @@ set_config_var() {
   local val="$2"
   # If var already in config, replace it; else append
   if grep -q "^export $var=" "$CONFIG_FILE" 2>/dev/null; then
-    sed -i "s|^export $var=.*|export $var=\"$val\"|g" "$CONFIG_FILE"
+    # macOS requires an extension with -i, even if it's empty
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      sed -i '' "s|^export $var=.*|export $var=\"$val\"|g" "$CONFIG_FILE"
+    else
+      sed -i "s|^export $var=.*|export $var=\"$val\"|g" "$CONFIG_FILE"
+    fi
   else
     echo "export $var=\"$val\"" >> "$CONFIG_FILE"
   fi
@@ -108,10 +113,18 @@ if [ -z "${COHERE_DEBUG_MODE:-}" ]; then
   source "$CONFIG_FILE"
 fi
 
+# 1f) Set default model if not already set
+if [ -z "${COHERE_DEFAULT_MODEL:-}" ]; then
+  set_config_var "COHERE_DEFAULT_MODEL" "command-r-plus"
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
 ###############################################################################
 # 2) Basic definitions and color styling
 ###############################################################################
-MODEL="command-r-plus"
+# Use the configured default model or default to command-r-plus
+MODEL="${COHERE_DEFAULT_MODEL:-command-r-plus}"
 
 # Cohere-inspired colors
 COHERE_PINK="#FFC8DD"     # Used for user message borders
@@ -131,11 +144,22 @@ init_conversation() {
   chmod 600 "$MEMORY_FILE" || true
   
   # Set the system message separately
-  SYSTEM_MESSAGE="You are an AI assistant powered by Command R+."
+  SYSTEM_MESSAGE="You are an AI assistant powered by Cohere's $MODEL model."
+  
+  # For Command A model, we need to initialize with a starter message pair 
+  # to avoid the "all elements in history must have a message" error
+  if [[ "$MODEL" == "command-a-03-2025" ]]; then
+    # Add a hidden "starter" conversation to ensure the history format is valid
+    CONVERSATION=$(echo "$CONVERSATION" | jq '. + [
+      {"role":"User","content":"System: Initialize conversation."},
+      {"role":"Chatbot","content":"System: Conversation initialized and ready."}
+    ]')
+    echo "$CONVERSATION" > "$MEMORY_FILE"
+  fi
 }
 
 # Initialize the system message
-SYSTEM_MESSAGE="You are an AI assistant powered by Command R+."
+SYSTEM_MESSAGE="You are an AI assistant powered by Cohere's $MODEL model."
 
 # For this version, let's always start with a clean conversation
 # to ensure we're using the right role format
@@ -172,7 +196,7 @@ update_system_message() {
   fi
 
   # Update the system message
-  SYSTEM_MESSAGE="You are an AI assistant powered by Command R+."
+  SYSTEM_MESSAGE="You are an AI assistant powered by Cohere's $MODEL model."
   SYSTEM_MESSAGE+="\n\nLocation: $city"
   SYSTEM_MESSAGE+="\nLocal time/date: $now"
   SYSTEM_MESSAGE+="\nUse this context as needed to inform your answers."
@@ -359,6 +383,13 @@ handle_upload() {
     | jq --arg content "I've uploaded the file: $filepath" '. + [{"role":"User","content": $content}]'
   )"
   echo "$CONVERSATION" > "$MEMORY_FILE"
+  
+  # Add a system response to ensure the conversation format is valid
+  CONVERSATION="$(
+    echo "$CONVERSATION" \
+    | jq --arg content "I've received your file and will analyze its contents." '. + [{"role":"Chatbot","content": $content}]'
+  )"
+  echo "$CONVERSATION" > "$MEMORY_FILE"
 
   gum style \
     --border normal --padding "0 1" \
@@ -374,16 +405,18 @@ gum style \
   --border normal --padding "1 2" \
   --border-foreground "$COHERE_ACCENT" \
   --width "$box_width" \
-  "Welcome to Command R+ Chat! (v$CLI_VERSION)
+  "Welcome to Cohere Chat! (v$CLI_VERSION)
 
-Commands:
-- :w <query>   => single-turn web search
-- :u <file>    => upload .pdf or .txt (<= 20MB)
-- :c           => clear the screen
-- :d           => toggle debug mode
+Current model: $MODEL
+
+Basic Commands:
+- :w <query>   => web search
+- :u <file>    => upload file
+- :m <model>   => switch model
+- :h           => show all commands
 - :q           => quit
 
-Type anything else for normal multi-turn conversation."
+Type anything else for normal conversation."
 
 ###############################################################################
 # 6) Main loop
@@ -410,6 +443,27 @@ while true; do
     continue
   fi
   
+  # Handle :h command (show help)
+  if [ "$USER_INPUT" = ":h" ]; then
+    gum style \
+      --border normal --padding "1 2" \
+      --border-foreground "$COHERE_ACCENT" \
+      --width "$box_width" \
+      "Cohere Chat Commands:
+
+- :w <query>   => single-turn web search
+- :u <file>    => upload .pdf or .txt (<= 20MB)
+- :c           => clear the screen
+- :d           => toggle debug mode
+- :m <model>   => switch model (Command R+, Command A)
+- :i           => show current model information
+- :h           => show this help message
+- :q           => quit
+
+Type anything else for normal multi-turn conversation."
+    continue
+  fi
+  
   # Handle :d command (toggle debug mode)
   if [ "$USER_INPUT" = ":d" ]; then
     if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
@@ -422,6 +476,134 @@ while true; do
     # Re-source the config to get the updated value
     source "$CONFIG_FILE"
     continue
+  fi
+  
+  # Handle :i command (show model information)
+  if [ "$USER_INPUT" = ":i" ]; then
+    # Make a call to get model info
+    MODEL_INFO="$(
+      gum spin --spinner dot --title "Fetching information about $MODEL..." -- \
+        curl -s "https://api.cohere.ai/v1/chat" \
+          -H "Authorization: Bearer $COHERE_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "{
+              \"model\": \"$MODEL\",
+              \"message\": \"What is your model name and version? Please be very specific and include all version details. Answer in 15 words or less.\",
+              \"preamble\": \"You are an AI assistant powered by Cohere. Please answer questions about your model name and version truthfully.\"
+            }"
+    )"
+    
+    MODEL_RESPONSE="$(parse_cohere_response_blocks "$MODEL_INFO")"
+    
+    # Get model capabilities
+    CAPABILITIES_INFO="$(
+      gum spin --spinner dot --title "Fetching capabilities..." -- \
+        curl -s "https://api.cohere.ai/v1/chat" \
+          -H "Authorization: Bearer $COHERE_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "{
+              \"model\": \"$MODEL\",
+              \"message\": \"What are your key capabilities compared to other Cohere models? Answer in 25 words or less.\",
+              \"preamble\": \"You are an AI assistant powered by Cohere. Please answer questions about your capabilities truthfully and concisely.\"
+            }"
+    )"
+    
+    CAPABILITIES_RESPONSE="$(parse_cohere_response_blocks "$CAPABILITIES_INFO")"
+    
+    # Format output
+    if [[ "$MODEL" == "command-a-03-2025" ]]; then
+      MODEL_TYPE="Command A (March 2025)"
+    elif [[ "$MODEL" == "command-r-plus" ]]; then
+      MODEL_TYPE="Command R+"
+    else 
+      MODEL_TYPE="$MODEL"
+    fi
+    
+    gum style \
+      --border normal --padding "1 2" \
+      --border-foreground "$COHERE_ACCENT" \
+      --width "$box_width" \
+      "MODEL INFORMATION
+
+API Name: $MODEL
+Product Name: $MODEL_TYPE
+
+Model Self-Identification:
+\"$MODEL_RESPONSE\"
+
+Key Capabilities:
+$CAPABILITIES_RESPONSE
+
+Note: The API name may differ from how the model identifies itself internally."
+    continue
+  fi
+  
+  # Handle :m command (change model)
+  if [[ "$USER_INPUT" =~ ^:m[[:space:]]+(.*) ]]; then
+    USER_MODEL_NAME="${BASH_REMATCH[1]}"
+    
+    # Convert user-friendly model names to API model names
+    # Convert to lowercase for case-insensitive matching
+    MODEL_NAME_LOWER=$(echo "$USER_MODEL_NAME" | tr '[:upper:]' '[:lower:]')
+    
+    if [[ "$MODEL_NAME_LOWER" == "command-r-plus" || 
+          "$MODEL_NAME_LOWER" == "command r+" || 
+          "$MODEL_NAME_LOWER" == "command r" || 
+          "$MODEL_NAME_LOWER" == "r+" ]]; then
+      MODEL_NAME="command-r-plus"
+    elif [[ "$MODEL_NAME_LOWER" == "command-a-03-2025" || 
+            "$MODEL_NAME_LOWER" == "command a" || 
+            "$MODEL_NAME_LOWER" == "command-a" || 
+            "$MODEL_NAME_LOWER" == "a" ]]; then
+      MODEL_NAME="command-a-03-2025"
+    else
+      MODEL_NAME="$USER_MODEL_NAME"  # Keep original if no match
+    fi
+    
+    if [[ "$MODEL_NAME" == "command-r-plus" || "$MODEL_NAME" == "command-a-03-2025" ]]; then
+      # Check if we are changing to a different model
+      if [[ "$MODEL" != "$MODEL_NAME" ]]; then
+        # Verify the model exists by making a simple test call
+        TEST_RESPONSE="$(
+          gum spin --spinner dot --title "Verifying $MODEL_NAME is available..." -- \
+            curl -s -X POST "https://api.cohere.ai/v1/chat" \
+              -H "Authorization: Bearer $COHERE_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"model\": \"$MODEL_NAME\",
+                \"message\": \"Hello\",
+                \"preamble\": \"You are an AI assistant powered by Cohere's $MODEL_NAME model.\"
+              }"
+        )"
+        
+        # Check if there was an error with the model
+        if echo "$TEST_RESPONSE" | jq -e 'has("message") and (.message | type == "string")' >/dev/null 2>&1; then
+          ERROR_MSG=$(echo "$TEST_RESPONSE" | jq -r '.message')
+          if [[ "$ERROR_MSG" == *"model"* || "$ERROR_MSG" == *"invalid"* ]]; then
+            gum style --foreground "#FF0000" "Error: $ERROR_MSG"
+            continue
+          fi
+        fi
+        
+        # Reset conversation history when switching models since formats are incompatible
+        init_conversation
+        gum style --foreground "#FFA500" "Conversation history reset due to model change."
+      fi
+      
+      set_config_var "COHERE_DEFAULT_MODEL" "$MODEL_NAME"
+      MODEL="$MODEL_NAME"
+      gum style --foreground "#FFA500" "Model switched to $MODEL_NAME"
+      # Re-source the config to get the updated value
+      source "$CONFIG_FILE"
+      # Update system message immediately to use new model
+      update_system_message
+      continue
+    else
+      gum style --foreground "#FF0000" "Invalid model name. Supported models: 
+- Command R+ (aliases: r+, command r, command r+)
+- Command A (aliases: a, command a, command-a-03-2025)"
+      continue
+    fi
   fi
 
   # Print user input
@@ -454,9 +636,18 @@ while true; do
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_ACCENT" \
         --width "$box_width" \
-        "Assistant (web): No text returned.\nRaw response: $(echo "$RESPONSE" | jq -c '.')"
+        "Assistant (Web Search): No text returned.\nRaw response: $(echo "$RESPONSE" | jq -c '.')"
     else
-      FULL_RESPONSE="Assistant (web): $ASSISTANT_CONTENT$(format_citations "$RESPONSE")"
+      # Use nicer display names for the models
+      if [[ "$MODEL" == "command-a-03-2025" ]]; then
+        DISPLAY_MODEL="Command A"
+      elif [[ "$MODEL" == "command-r-plus" ]]; then
+        DISPLAY_MODEL="Command R+"
+      else
+        DISPLAY_MODEL="$MODEL"
+      fi
+      
+      FULL_RESPONSE="Assistant ($DISPLAY_MODEL - web): $ASSISTANT_CONTENT$(format_citations "$RESPONSE")"
       gum style \
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_PURPLE" \
@@ -480,8 +671,17 @@ while true; do
     # Save conversation to file
     echo "$CONVERSATION" > "$MEMORY_FILE"
     
-    # Create a clean chat history (skip the current user message)
-    CHAT_HISTORY=$(echo "$CONVERSATION" | jq 'map(select(.content != "'"$USER_INPUT"'"))')
+    # Create a clean chat history with proper format for API
+    # The format changed between models, so we need to adapt
+    if [[ "$MODEL" == "command-a-03-2025" ]]; then
+      # Command A requires the message field in every history entry
+      CHAT_HISTORY=$(echo "$CONVERSATION" | jq 'map(select(.content != "'"$USER_INPUT"'")) | map({role: .role, message: .content})')
+    else
+      # Command R+ uses the content field
+      # Make sure we only have pairs of messages (user + chatbot) for better reliability
+      # This ensures we always have complete message pairs in the history
+      CHAT_HISTORY=$(echo "$CONVERSATION" | jq 'map(select(.content != "'"$USER_INPUT"'"))')
+    fi
     
     # Prepare the request
     REQUEST="{
@@ -495,8 +695,11 @@ while true; do
     if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
       NUM_MESSAGES=$(echo "$CONVERSATION" | jq '. | length')
       HISTORY_SAMPLE=$(echo "$CONVERSATION" | jq -c '.')
+      CHAT_HISTORY_SAMPLE=$(echo "$CHAT_HISTORY" | jq -c '.')
+      gum style --foreground "#FFA500" "Using model: $MODEL"
       gum style --foreground "#FFA500" "Sending request with $NUM_MESSAGES message(s) in history"
-      gum style --foreground "#FFA500" "Sample: $HISTORY_SAMPLE"
+      gum style --foreground "#FFA500" "Original conversation: $HISTORY_SAMPLE"
+      gum style --foreground "#FFA500" "Formatted chat_history: $CHAT_HISTORY_SAMPLE"
       
       # Write the request to a debug file
       echo "$REQUEST" > "$DEBUG_DIR/last-request.json"
@@ -504,6 +707,23 @@ while true; do
     fi
     
     # Make the API call using v1 endpoint with chat_history
+    # For Command A model, we need to treat the first message pair specially
+    # to avoid the "all elements in history must have a message" error
+    if [[ "$MODEL" == "command-a-03-2025" && $(echo "$CHAT_HISTORY" | jq 'length') -eq 2 ]]; then
+      # If we have just the initialization pair, skip it
+      if echo "$CHAT_HISTORY" | jq -e '.[0].message | contains("System: Initialize conversation")' >/dev/null 2>&1; then
+        REQUEST="{
+            \"model\": \"$MODEL\",
+            \"message\": \"$USER_INPUT\",
+            \"chat_history\": [],
+            \"preamble\": \"$SYSTEM_MESSAGE\"
+        }"
+        if [ "${COHERE_DEBUG_MODE:-}" = "true" ]; then
+          gum style --foreground "#FFA500" "Skipping initialization messages in history for first real query"
+        fi
+      fi
+    fi
+    
     RESPONSE="$(
       gum spin --spinner dot --title "$MODEL is thinking..." -- \
         curl -s "https://api.cohere.ai/v1/chat" \
@@ -515,7 +735,16 @@ while true; do
     ASSISTANT_CONTENT="$(parse_cohere_response_blocks "$RESPONSE")"
 
     if [ -n "$ASSISTANT_CONTENT" ]; then
-      FULL_RESPONSE="Assistant (Command R+): $ASSISTANT_CONTENT$(format_citations "$RESPONSE")"
+      # Use nicer display names for the models
+      if [[ "$MODEL" == "command-a-03-2025" ]]; then
+        DISPLAY_MODEL="Command A"
+      elif [[ "$MODEL" == "command-r-plus" ]]; then
+        DISPLAY_MODEL="Command R+"
+      else
+        DISPLAY_MODEL="$MODEL"
+      fi
+      
+      FULL_RESPONSE="Assistant ($DISPLAY_MODEL): $ASSISTANT_CONTENT$(format_citations "$RESPONSE")"
 
       gum style \
         --border normal --padding "0 1" \
@@ -542,11 +771,20 @@ while true; do
         gum style --foreground "#FFA500" "Debug info saved to $DEBUG_DIR/last-error.json"
       fi
       
+      # Use nicer display names for the models
+      if [[ "$MODEL" == "command-a-03-2025" ]]; then
+        DISPLAY_MODEL="Command A"
+      elif [[ "$MODEL" == "command-r-plus" ]]; then
+        DISPLAY_MODEL="Command R+"
+      else
+        DISPLAY_MODEL="$MODEL"
+      fi
+      
       gum style \
         --border normal --padding "0 1" \
         --border-foreground "$COHERE_ACCENT" \
         --width "$box_width" \
-        "$ERROR_MESSAGE"
+        "Assistant ($DISPLAY_MODEL): $ERROR_MESSAGE"
     fi
   fi
 done

@@ -1,11 +1,12 @@
 # 💬🌸 Cohere CLI: Seamlessly interact with Cohere's AI directly from your terminal!
 ![ascii-art-6_upscayl_4x_upscayl-standard-4x](https://github.com/user-attachments/assets/b848c8dd-0a15-478b-baed-036a3aae2e7d)
 
-**Cohere CLI** is a powerful and user-friendly command-line interface that allows seamless interaction with Cohere's AI models directly from your terminal. Whether you're looking to engage in multi-turn conversations, perform single-turn web searches, or upload files for analysis, **Cohere CLI** has you covered.
+**Cohere CLI** is a powerful and user-friendly command-line interface that allows seamless interaction with Cohere's AI models directly from your terminal. With an intuitive interface, streamlined commands, and comprehensive help system, it provides a polished experience for everyday AI interactions. Whether you're looking to engage in multi-turn conversations, perform single-turn web searches, or upload files for analysis, **Cohere CLI** has you covered.
 
 ## 🚀 Features
 
-- **Multi-Turn Chat:** Engage in extended conversations with Cohere's Command R+ model, maintaining context across multiple interactions.
+- **Multi-Turn Chat:** Engage in extended conversations with Cohere's AI models, maintaining context across multiple interactions.
+- **Multiple Model Support:** Choose between Command R+, Command A (03-2025), and more with the `:m <model>` command.
 - **Single-Turn Web Search:** Use the `:w <query>` command to perform quick web searches directly from the terminal.
 - **File Upload:** Upload PDF or TXT files (up to 20MB) with the `:u <file>` command for the AI to analyze.
 - **Clear Screen:** Use the `:c` command to refresh your terminal display without losing your conversation history.
@@ -55,9 +56,12 @@ The installation script will attempt to install these dependencies if they're mi
 
 Once installed, simply type `cohere` in your terminal to start a conversation. The following commands are available:
 
-- **Regular input:** Type any message to engage in a multi-turn conversation with Command R+
+- **Regular input:** Type any message to engage in a multi-turn conversation
 - **`:w <query>`:** Perform a single-turn web search (e.g., `:w what is the capital of France?`)
 - **`:u <file>`:** Upload a PDF or TXT file (up to 20MB) for analysis (e.g., `:u ~/Documents/report.pdf`)
+- **`:m <model>`:** Switch between available models with user-friendly names (e.g., `:m Command A` or `:m r+`)
+- **`:i`:** Show detailed information about the current model with self-identification
+- **`:h`:** Show all available commands and options
 - **`:c`:** Clear the screen without losing conversation history
 - **`:d`:** Toggle debug mode to see detailed information about API requests/responses
 - **`:q`:** Quit the CLI
@@ -84,7 +88,12 @@ Conversation history is stored in `~/.config/cohere-cli/chat-memory.json` and is
 
 ## 🧩 Technical Details
 
-- Uses Cohere's Command R+ model
+- Supports multiple Cohere models with user-friendly aliases:
+  - Command R+: Can be selected using "r+", "command r", "command r+", or "command-r-plus"
+  - Command A: Can be selected using "a", "command a", "command-a", or "command-a-03-2025"
+- User-friendly interface with simplified initial command display
+- Comprehensive help system via the `:h` command
+- Enhanced model information display with the `:i` command
 - Conversations are maintained using the chat history API
 - Web searches utilize Cohere's built-in web connector
 - Terminal UI is built with [gum](https://github.com/charmbracelet/gum) for a clean, interactive experience
